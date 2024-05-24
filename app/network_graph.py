@@ -15,15 +15,18 @@ import matplotlib.pyplot as plt
 import joblib
 from sklearn.feature_extraction.text import CountVectorizer
 import re
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
+
+CLIENT_SECRETS_FILE = os.getenv('CLIENT_SECRETS_FILE')
+SCOPES = [os.getenv('SCOPES')]
+TOKEN_JSON_FILE = os.getenv('TOKEN_JSON_FILE')
+ENRICHED_JSON_FILE = os.getenv('ENRICHED_JSON_FILE')
 
 EMBEDDINGS_FILE = 'umap_embeddings.pkl'
 TOPICS_FILE = 'topics.pkl'
-
-CLIENT_SECRETS_FILE = 'client_secret_902701714108-2a6goqcd7bqmdosgms4k495bt4j09a9j.apps.googleusercontent.com.json'
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-TOKEN_JSON_FILE = 'token.json'
-ENRICHED_JSON_FILE = 'files/enriched_email_interactions.json'
 
 def get_email_interactions():
     creds = None
