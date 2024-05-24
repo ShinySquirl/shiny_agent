@@ -7,12 +7,15 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
+from dotenv import load_dotenv
 import os
 
-CLIENT_SECRETS_FILE = 'client_secret_902701714108-2a6goqcd7bqmdosgms4k495bt4j09a9j.apps.googleusercontent.com.json'
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-TOKEN_JSON_FILE = 'token.json'
-ENRICHED_JSON_FILE = 'files/enriched_email_interactions.json'
+load_dotenv()
+
+CLIENT_SECRETS_FILE = os.getenv('CLIENT_SECRETS_FILE')
+SCOPES = [os.getenv('SCOPES')]
+TOKEN_JSON_FILE = os.getenv('TOKEN_JSON_FILE')
+ENRICHED_JSON_FILE = os.getenv('ENRICHED_JSON_FILE')
 
 # Function to get email interactions from Gmail API
 def get_email_interactions():
