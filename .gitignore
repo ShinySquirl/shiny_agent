@@ -160,5 +160,5 @@ cython_debug/
 #.idea/
 venv/
 .env
-client_secret_902701714108-2a6goqcd7bqmdosgms4k495bt4j09a9j.apps.googleusercontent.com(1).json
 token.json
+client_secret_*.json
