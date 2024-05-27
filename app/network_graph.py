@@ -2,6 +2,9 @@ import json
 import base64
 import pandas as pd
 import numpy as np
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -9,25 +12,40 @@ from google.auth.transport.requests import Request
 import os
 from pyvis.network import Network
 import webbrowser
-from bertopic import BERTopic
-import umap
-import matplotlib.pyplot as plt
 import joblib
-from sklearn.feature_extraction.text import CountVectorizer
 import re
 from dotenv import load_dotenv
-import os
+from textblob import TextBlob
+from openai import OpenAI
+import umap
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
 
+
+# Load environment variables
 load_dotenv()
 
 CLIENT_SECRETS_FILE = os.getenv('CLIENT_SECRETS_FILE')
 SCOPES = [os.getenv('SCOPES')]
 TOKEN_JSON_FILE = os.getenv('TOKEN_JSON_FILE')
 ENRICHED_JSON_FILE = os.getenv('ENRICHED_JSON_FILE')
-
 EMBEDDINGS_FILE = 'umap_embeddings.pkl'
-TOPICS_FILE = 'topics.pkl'
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Ensure you have the necessary NLTK resources
+# nltk.download('punkt')
+# nltk.download('stopwords')
+
+# Function to clean and tokenize email content
+def preprocess_text(text):
+    text = re.sub(r'[^a-zA-Z\s]', '', text)  # Remove punctuation and numbers
+    tokens = word_tokenize(text.lower())  # Tokenize
+    tokens = [word for word in tokens if word not in stopwords.words('english')]  # Remove stop words
+    return ' '.join(tokens)
+
+# Function to get email interactions
 def get_email_interactions():
     creds = None
     if os.path.exists(TOKEN_JSON_FILE):
@@ -77,86 +95,65 @@ def get_email_interactions():
     
     return email_data
 
+# Initialize the network graph
 def initialize_network_graph():
     nt = Network(height="800px", width="100%", bgcolor="#222222", font_color="white", directed=True)
     nt.toggle_physics(False)
     return nt
 
+# Calculate strength of ties from email data
 def calculate_strength_of_ties(email_df):
     email_df['receivers'] = email_df['receivers'].str.split(', ')
     interactions = email_df.explode('receivers')
     tie_strength = interactions.groupby(['sender', 'receivers']).size().reset_index(name='count')
     return tie_strength
 
-def generate_bert_embeddings(texts):
-    if os.path.exists(EMBEDDINGS_FILE) and os.path.exists(TOPICS_FILE):
-        print("Loading existing embeddings and topics...")
+# Function to get OpenAI embeddings
+def get_openai_embeddings(text):
+    response = client.embeddings.create(input=text,
+    model="text-embedding-3-small")
+    return np.array(response.data[0].embedding)
+
+def generate_or_load_embeddings(texts, force_regenerate=False):
+    if os.path.exists(EMBEDDINGS_FILE) and not force_regenerate:
+        print("Loading existing embeddings...")
         umap_embeddings = joblib.load(EMBEDDINGS_FILE)
-        topics = joblib.load(TOPICS_FILE)
-        topic_model = BERTopic.load("topic_model")
     else:
-        print("Generating new embeddings and topics...")
-        topic_model = BERTopic(verbose=True)
-        topics, probabilities = topic_model.fit_transform(texts)
-        
-        # Ensure probabilities is a 2D array
-        if probabilities.ndim == 1:
-            probabilities = probabilities.reshape(-1, 1)
+        print("Generating new embeddings...")
+        embeddings = np.vstack([get_openai_embeddings(text) for text in texts])
         
         umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine')
-        umap_embeddings = umap_model.fit_transform(probabilities)
+        umap_embeddings = umap_model.fit_transform(embeddings)
 
         joblib.dump(umap_embeddings, EMBEDDINGS_FILE)
-        joblib.dump(topics, TOPICS_FILE)
-        topic_model.save("topic_model")
-        print("Embeddings and topics saved.")
+        print("Embeddings saved.")
         
-    return topics, umap_embeddings, topic_model
+    return umap_embeddings
 
-def extract_key_phrases(texts, topics):
-    vectorizer = CountVectorizer(ngram_range=(1, 3), stop_words='english')
-    X = vectorizer.fit_transform(texts)
+# Function to get sentiment score
+def get_sentiment(text):
+    return TextBlob(text).sentiment.polarity
+
+def cluster_topics(embeddings, n_clusters=5):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(embeddings)
+    return kmeans.labels_, kmeans.cluster_centers_
+
+def visualize_topics(embeddings, labels):
+    umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine')
+    umap_embeddings = umap_model.fit_transform(embeddings)
     
-    topic_labels = {}
-    for topic in set(topics):
-        if topic == -1:  # Skip the outlier topic
-            continue
-        topic_texts = [texts[i] for i, t in enumerate(topics) if t == topic]
-        X_topic = vectorizer.transform(topic_texts)
-        
-        # Sum the counts of each n-gram
-        ngram_sums = X_topic.sum(axis=0)
-        ngrams_freq = [(ngram, ngram_sums[0, idx]) for ngram, idx in vectorizer.vocabulary_.items()]
-        sorted_ngrams = sorted(ngrams_freq, key=lambda x: x[1], reverse=True)
-        
-        # Create label from the top n-grams
-        top_ngrams = [ngram for ngram, _ in sorted_ngrams[:5]]
-        topic_labels[topic] = ' | '.join(top_ngrams)
+    # Plotting the clusters
+    plt.figure(figsize=(12, 8))
+    scatter = plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c=labels, cmap='Spectral', s=5)
+    plt.legend(handles=scatter.legend_elements()[0], labels=set(labels))
+    plt.show()
     
-    return topic_labels
+    return umap_embeddings
 
-def clean_labels(labels):
-    cleaned_labels = {}
-    for topic, label in labels.items():
-        # Remove any emails and URLs from the labels
-        cleaned_label = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', '', label)
-        cleaned_label = re.sub(r'http\S+', '', cleaned_label)
-        cleaned_labels[topic] = cleaned_label.strip()
-    return cleaned_labels
-
-def create_custom_labels(topic_model):
-    topic_info = topic_model.get_topic_info()
-    labels = {}
-    for topic in topic_info['Topic'].values:
-        if topic != -1:  # -1 is usually the outlier topic
-            words = topic_model.get_topic(topic)
-            label = ', '.join([word for word, _ in words[:5]])
-            labels[topic] = label
-    return labels
-
-def integrate_email_data_with_topics(nt, email_df, umap_embeddings, edges_added):
-    email_df['x'] = umap_embeddings[:, 0]
-    email_df['y'] = umap_embeddings[:, 1]
+# Function to integrate email data with relationship strength into the network graph
+def integrate_email_data_with_strength(nt, email_df, embeddings, edges_added):
+    email_df['x'] = embeddings[:, 0]
+    email_df['y'] = embeddings[:, 1]
 
     for index, row in email_df.iterrows():
         sender = row['sender']
@@ -172,12 +169,14 @@ def integrate_email_data_with_topics(nt, email_df, umap_embeddings, edges_added)
                 nt.add_node(receiver, label=receiver, color="#4287f5", title=f"Receiver: {receiver}", x=receiver_x, y=receiver_y)
 
             if (sender, receiver) not in edges_added:
-                nt.add_edge(sender, receiver, title=f"{sender} -> {receiver}", width=2)
+                nt.add_edge(sender, receiver, title=f"{sender} -> {receiver} (Strength: {row['relationship_strength']})", width=2)
                 edges_added.add((sender, receiver))
 
+# Function to add a legend to the network graph
 def add_legend(nt):
     nt.add_node("Legend", label="Legend", shape="box", title="Legend: Node Colors<br>Red: Sender<br>Blue: Receivers")
 
+# Function to display the network graph
 def display_graph(nt, filename):
     nt.show_buttons(filter_=['physics'])
     nt.repulsion(node_distance=800, central_gravity=0.1, spring_length=350, spring_strength=0.05)
@@ -186,19 +185,28 @@ def display_graph(nt, filename):
     print(f"Graph saved to {html_path}")
     webbrowser.open('file://' + html_path)
 
-def visualize_topics_with_key_phrases(texts, topics, topic_model):
-    fig = topic_model.visualize_topics()
+def integrate_email_data_with_topics(nt, email_df, umap_embeddings, labels, edges_added):
+    email_df['x'] = umap_embeddings[:, 0]
+    email_df['y'] = umap_embeddings[:, 1]
+    email_df['topic'] = labels
     
-    # Get key phrases for each topic
-    labels = extract_key_phrases(texts, topics)
-    cleaned_labels = clean_labels(labels)
-    
-    # Add labels to the plot
-    for trace in fig.data:
-        if trace.name in cleaned_labels:
-            trace.text = cleaned_labels[trace.name]
-    
-    fig.show()
+    for index, row in email_df.iterrows():
+        sender = row['sender']
+        receivers = row['receivers'].split(', ')
+        topic = row['topic']
+
+        if sender not in nt.node_ids:
+            nt.add_node(sender, label=sender, color="#f54242", title=f"Sender: {sender}, Topic: {topic}", x=row['x'], y=row['y'])
+
+        for receiver in receivers:
+            if receiver not in nt.node_ids:
+                receiver_x = email_df[email_df['sender'] == receiver]['x'].values[0] if not email_df[email_df['sender'] == receiver].empty else row['x']
+                receiver_y = email_df[email_df['sender'] == receiver]['y'].values[0] if not email_df[email_df['sender'] == receiver].empty else row['y']
+                nt.add_node(receiver, label=receiver, color="#4287f5", title=f"Receiver: {receiver}, Topic: {topic}", x=receiver_x, y=receiver_y)
+
+            if (sender, receiver) not in edges_added:
+                nt.add_edge(sender, receiver, title=f"{sender} -> {receiver} (Strength: {row['relationship_strength']})", width=2)
+                edges_added.add((sender, receiver))
 
 def main():
     nt = initialize_network_graph()
@@ -215,16 +223,34 @@ def main():
         email_df = pd.DataFrame(email_data)
         email_df.to_json(ENRICHED_JSON_FILE, orient='records', lines=True)
 
-    texts = email_df['subject'] + ' ' + email_df['body']
-    topics, umap_embeddings, topic_model = generate_bert_embeddings(texts)
+    # Limit to the last 10 emails for testing purposes
+    email_df = email_df.tail(10)
 
-    integrate_email_data_with_topics(nt, email_df, umap_embeddings, edges_added)
+    # Preprocess email content
+    email_df['cleaned_content'] = email_df['body'].apply(preprocess_text)
+
+    # Generate embeddings
+    embeddings = np.vstack([get_openai_embeddings(text) for text in email_df['cleaned_content']])
+
+    # Cluster topics
+    labels, _ = cluster_topics(embeddings)
+
+    # Visualize topics and get 2D embeddings
+    umap_embeddings = visualize_topics(embeddings, labels)
+
+    # Calculate sentiment and relationship strength
+    email_df['sentiment'] = email_df['body'].apply(get_sentiment)
+    interaction_count = email_df.groupby(['sender', 'receivers']).size().reset_index(name='frequency')
+    email_df = pd.merge(email_df, interaction_count, on=['sender', 'receivers'])
+    email_df['relationship_strength'] = email_df['sentiment'] * email_df['frequency']
+
+    # Integrate email data with relationship strength and topics into the network graph
+    integrate_email_data_with_topics(nt, email_df, umap_embeddings, labels, edges_added)
 
     add_legend(nt)
     
     display_graph(nt, "network.html")
 
-    visualize_topics_with_key_phrases(texts, topics, topic_model)
-
 if __name__ == "__main__":
     main()
+
