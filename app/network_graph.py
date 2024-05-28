@@ -18,9 +18,10 @@ from dotenv import load_dotenv
 from textblob import TextBlob
 from openai import OpenAI
 import umap
-from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
-
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import Counter
 
 # Load environment variables
 load_dotenv()
@@ -44,6 +45,119 @@ def preprocess_text(text):
     tokens = word_tokenize(text.lower())  # Tokenize
     tokens = [word for word in tokens if word not in stopwords.words('english')]  # Remove stop words
     return ' '.join(tokens)
+
+def sanitize_for_json(text):
+    return json.dumps(text)
+
+def ensure_utf8(text):
+    # Decode using UTF-8, replacing invalid bytes
+    clean_text = text.encode('utf-8', 'replace').decode('utf-8', 'replace')
+    # Remove substrings enclosed in <| and |> (special tokens)
+    clean_text = re.sub(r'<\|.*?\|>', '', clean_text)
+    # Remove extra spaces
+    clean_text = ' '.join(clean_text.split())
+    return clean_text
+
+def sanitize_text(text):
+    if not text:
+        return " "
+    return ensure_utf8(text)
+
+def divide_list_into_batches(lst, batch_size):
+    for i in range(0, len(lst), batch_size):
+        yield lst[i:i + batch_size]
+        
+def extract_top_keywords(texts, n_keywords=3):
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
+    X = vectorizer.fit_transform(texts)
+    terms = vectorizer.get_feature_names_out()
+    
+    tfidf_sorting = np.argsort(X.toarray()).flatten()[::-1]
+    top_n = tfidf_sorting[:n_keywords]
+    
+    return [terms[i] for i in top_n]
+
+def label_clusters(texts, labels):
+    cluster_texts = {}
+    for text, label in zip(texts, labels):
+        if label not in cluster_texts:
+            cluster_texts[label] = []
+        cluster_texts[label].append(text)
+    
+    cluster_keywords = {}
+    for label, texts in cluster_texts.items():
+        keywords = extract_top_keywords(texts)
+        cluster_keywords[label] = ' '.join(keywords)
+    
+    return cluster_keywords
+
+def visualize_topics(embeddings, labels, texts):
+    umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine')
+    umap_embeddings = umap_model.fit_transform(embeddings)
+    
+    cluster_keywords = label_clusters(texts, labels)
+    
+    # Plotting the clusters
+    plt.figure(figsize=(12, 8))
+    scatter = plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c=labels, cmap='Spectral', s=5)
+    plt.colorbar()
+    plt.title('UMAP projection of the email embeddings')
+    
+    # Annotate clusters
+    for label, keywords in cluster_keywords.items():
+        x, y = np.mean(umap_embeddings[labels == label], axis=0)
+        plt.text(x, y, keywords, fontsize=12, bbox=dict(facecolor='white', alpha=0.5))
+    
+    plt.show()
+    
+    return umap_embeddings
+
+# Function to get OpenAI embeddings
+def get_openai_embeddings(texts):
+    embeddings = []
+    sanitized_texts = [sanitize_text(text) for text in texts]
+   
+    for batch in divide_list_into_batches(sanitized_texts, batch_size=100):  # Adjust batch size if needed
+        # Ensure batch is a list of non-empty strings
+        batch = [text for text in batch if text.strip()]
+        
+        # Check token count
+        total_tokens = sum(len(text.split()) for text in batch)
+        if total_tokens > 8192:
+            print(f"Skipping batch with {total_tokens} tokens, which exceeds the limit.")
+            continue
+        
+        if not batch:
+            continue
+        
+        try:
+            response = client.embeddings.create(input=batch, model="text-embedding-3-small")
+            embeddings.extend(np.array(item.embedding) for item in response.data)
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+            print(f"Batch content: {batch}")
+        
+    return embeddings
+
+def generate_or_load_embeddings(texts, force_regenerate=False):
+    if os.path.exists(EMBEDDINGS_FILE) and not force_regenerate:
+        print("Loading existing embeddings...")
+        umap_embeddings = joblib.load(EMBEDDINGS_FILE)
+    else:
+        print("Generating new embeddings...")
+        embeddings = np.vstack([get_openai_embeddings([text]) for text in texts])
+        
+        umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.1, metric='cosine')
+        umap_embeddings = umap_model.fit_transform(embeddings)
+
+        joblib.dump(umap_embeddings, EMBEDDINGS_FILE)
+        print("Embeddings saved.")
+        
+    return umap_embeddings
+
+# Function to get sentiment score
+def get_sentiment(text):
+    return TextBlob(text).sentiment.polarity
 
 # Function to get email interactions
 def get_email_interactions():
@@ -108,83 +222,7 @@ def calculate_strength_of_ties(email_df):
     tie_strength = interactions.groupby(['sender', 'receivers']).size().reset_index(name='count')
     return tie_strength
 
-# Function to get OpenAI embeddings
-def get_openai_embeddings(text):
-    response = client.embeddings.create(input=text,
-    model="text-embedding-3-small")
-    return np.array(response.data[0].embedding)
-
-def generate_or_load_embeddings(texts, force_regenerate=False):
-    if os.path.exists(EMBEDDINGS_FILE) and not force_regenerate:
-        print("Loading existing embeddings...")
-        umap_embeddings = joblib.load(EMBEDDINGS_FILE)
-    else:
-        print("Generating new embeddings...")
-        embeddings = np.vstack([get_openai_embeddings(text) for text in texts])
-        
-        umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine')
-        umap_embeddings = umap_model.fit_transform(embeddings)
-
-        joblib.dump(umap_embeddings, EMBEDDINGS_FILE)
-        print("Embeddings saved.")
-        
-    return umap_embeddings
-
-# Function to get sentiment score
-def get_sentiment(text):
-    return TextBlob(text).sentiment.polarity
-
-def cluster_topics(embeddings, n_clusters=5):
-    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(embeddings)
-    return kmeans.labels_, kmeans.cluster_centers_
-
-def visualize_topics(embeddings, labels):
-    umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine')
-    umap_embeddings = umap_model.fit_transform(embeddings)
-    
-    # Plotting the clusters
-    plt.figure(figsize=(12, 8))
-    scatter = plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c=labels, cmap='Spectral', s=5)
-    plt.legend(handles=scatter.legend_elements()[0], labels=set(labels))
-    plt.show()
-    
-    return umap_embeddings
-
 # Function to integrate email data with relationship strength into the network graph
-def integrate_email_data_with_strength(nt, email_df, embeddings, edges_added):
-    email_df['x'] = embeddings[:, 0]
-    email_df['y'] = embeddings[:, 1]
-
-    for index, row in email_df.iterrows():
-        sender = row['sender']
-        receivers = row['receivers'].split(', ')
-
-        if sender not in nt.node_ids:
-            nt.add_node(sender, label=sender, color="#f54242", title=f"Sender: {sender}", x=row['x'], y=row['y'])
-
-        for receiver in receivers:
-            if receiver not in nt.node_ids:
-                receiver_x = email_df[email_df['sender'] == receiver]['x'].values[0] if not email_df[email_df['sender'] == receiver].empty else row['x']
-                receiver_y = email_df[email_df['sender'] == receiver]['y'].values[0] if not email_df[email_df['sender'] == receiver].empty else row['y']
-                nt.add_node(receiver, label=receiver, color="#4287f5", title=f"Receiver: {receiver}", x=receiver_x, y=receiver_y)
-
-            if (sender, receiver) not in edges_added:
-                nt.add_edge(sender, receiver, title=f"{sender} -> {receiver} (Strength: {row['relationship_strength']})", width=2)
-                edges_added.add((sender, receiver))
-
-# Function to add a legend to the network graph
-def add_legend(nt):
-    nt.add_node("Legend", label="Legend", shape="box", title="Legend: Node Colors<br>Red: Sender<br>Blue: Receivers")
-
-# Function to display the network graph
-def display_graph(nt, filename):
-    nt.show_buttons(filter_=['physics'])
-    nt.repulsion(node_distance=800, central_gravity=0.1, spring_length=350, spring_strength=0.05)
-    nt.save_graph(filename)
-    html_path = os.path.abspath(filename)
-    print(f"Graph saved to {html_path}")
-    webbrowser.open('file://' + html_path)
-
 def integrate_email_data_with_topics(nt, email_df, umap_embeddings, labels, edges_added):
     email_df['x'] = umap_embeddings[:, 0]
     email_df['y'] = umap_embeddings[:, 1]
@@ -208,6 +246,38 @@ def integrate_email_data_with_topics(nt, email_df, umap_embeddings, labels, edge
                 nt.add_edge(sender, receiver, title=f"{sender} -> {receiver} (Strength: {row['relationship_strength']})", width=2)
                 edges_added.add((sender, receiver))
 
+# Function to add a legend to the network graph
+def add_legend(nt):
+    nt.add_node("Legend", label="Legend", shape="box", title="Legend: Node Colors<br>Red: Sender<br>Blue: Receivers")
+
+# Function to display the network graph
+def display_graph(nt, filename):
+    nt.show_buttons(filter_=['physics'])
+    nt.repulsion(node_distance=800, central_gravity=0.1, spring_length=350, spring_strength=0.05)
+    nt.save_graph(filename)
+    html_path = os.path.abspath(filename)
+    print(f"Graph saved to {html_path}")
+    webbrowser.open('file://' + html_path)
+
+# Cluster topics
+def cluster_topics(embeddings, n_clusters=5):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(embeddings)
+    return kmeans.labels_, kmeans.cluster_centers_
+
+# Visualize topics
+def visualize_topics(embeddings, labels):
+    umap_model = umap.UMAP(n_neighbors=15, n_components=2, min_dist=0.0, metric='cosine')
+    umap_embeddings = umap_model.fit_transform(embeddings)
+    
+    # Plotting the clusters
+    plt.figure(figsize=(12, 8))
+    scatter = plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c=labels, cmap='Spectral', s=5)
+    plt.colorbar()
+    plt.title('UMAP projection of the email embeddings')
+    plt.show()
+    
+    return umap_embeddings
+
 def main():
     nt = initialize_network_graph()
     edges_added = set()
@@ -222,9 +292,9 @@ def main():
         email_data = get_email_interactions()
         email_df = pd.DataFrame(email_data)
         email_df.to_json(ENRICHED_JSON_FILE, orient='records', lines=True)
-
-    # Limit to the last 10 emails for testing purposes
-    email_df = email_df.tail(10)
+    
+    # Limit to a larger set of emails for meaningful clustering
+    email_df = email_df.tail(100)
 
     # Preprocess email content
     email_df['cleaned_content'] = email_df['body'].apply(preprocess_text)
@@ -236,7 +306,7 @@ def main():
     labels, _ = cluster_topics(embeddings)
 
     # Visualize topics and get 2D embeddings
-    umap_embeddings = visualize_topics(embeddings, labels)
+    umap_embeddings = visualize_topics(embeddings, labels, email_df['cleaned_content'])
 
     # Calculate sentiment and relationship strength
     email_df['sentiment'] = email_df['body'].apply(get_sentiment)
@@ -248,9 +318,8 @@ def main():
     integrate_email_data_with_topics(nt, email_df, umap_embeddings, labels, edges_added)
 
     add_legend(nt)
-    
+
     display_graph(nt, "network.html")
 
 if __name__ == "__main__":
     main()
-
