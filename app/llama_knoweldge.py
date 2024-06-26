@@ -1,13 +1,14 @@
 import os
 import json
 import logging
+import requests
+import time
 from pydantic import BaseModel
 from typing import Optional, List
 from tqdm import tqdm
-from llama_index.core import SimpleDirectoryReader, Document
+from llama_index.core import SimpleDirectoryReader, Document, PropertyGraphIndex, StorageContext, load_index_from_storage
 from llama_index.core.indices.property_graph import PropertyGraphIndex, SchemaLLMPathExtractor
 from llama_index.graph_stores.neo4j import Neo4jPGStore
-import nest_asyncio
 from typing import Literal
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -18,23 +19,17 @@ from llama_index.core.indices.property_graph import (
 )
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from typing import Any, Optional
+from llama_index.llms.anthropic import Anthropic
+from llama_index.core import Settings
+import asyncio
+import httpx  # Import httpx for HTTP operations
+from tenacity import retry, stop_after_attempt, wait_random_exponential  # Import tenacity for retries
+
+tokenizer = Anthropic().tokenizer
+Settings.tokenizer = tokenizer
 
 # Load environment variables
 load_dotenv()
-
-class Entities(BaseModel):
-    """List of named entities int he text such as names of people, orgs, concepts, locations"""
-    names: Optional[List[str]]
-    
-prompt_template_entities = """
-Extract all names entities such as names of people, organizations, concepts, and locations
-from the following text: 
-{text}
-"""
-
-
-# Apply nest_asyncio for nested async loops
-nest_asyncio.apply()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -44,9 +39,12 @@ logger = logging.getLogger(__name__)
 username_neo4j = os.getenv("USERNAME_NEO4J")
 password_neo4j = os.getenv("PASSWORD_NEO4J")
 uri_neo4j = os.getenv("URI_NEO4J")
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 
-llm = OpenAI(model="gpt-4o", temperature=0.3)
-embed_model = OpenAIEmbedding(model_name="text-embedding-3-small")
+
+embed_model = OpenAIEmbedding(model_name="text-embedding-3-small", embed_batch_size=42)
+
+llm = OpenAI(model="gpt-4-turbo", temperature=0.3)
 # Define entity and relationship types
 entities = Literal["PERSON", "TOPIC"]
 relations = Literal["EXPERT_IN", "WORKING_ON", "WORKED_WITH", "KNOWS"]
@@ -95,83 +93,79 @@ def initialize_neo4j_store(username, password, uri):
         logger.error(f"Failed to connect to Neo4j: {e}")
         raise
 
-# Function to load pre-embedded emails
-def load_preembedded_emails(file_path, batch_size=50, max_emails=50):
-    with open(file_path, 'r') as file:
-        email_count = 0
-        while email_count < max_emails:
-            documents = []
-            for _ in range(batch_size):
-                if email_count >= max_emails:
-                    break
-                line = file.readline()
-                if not line:
-                    break
-                data = json.loads(line.strip())
-                email_text = data['body']
-                embedding = data['embeddings']
-                document = Document(text=email_text, embedding=embedding)
-                documents.append(document)
-                email_count += 1
-            if not documents:
-                break
-            yield documents
-
-# Function to process email batch
-def process_batch(email_batch, kg_extractor, graph_store):
+# Function to initialize and save the index
+def initialize_and_save_index(documents, kg_extractor, graph_store, persist_dir):
     index = PropertyGraphIndex.from_documents(
-        email_batch,
+        documents,
         kg_extractors=[kg_extractor],
-        llm=llm,
-        embed_model=embed_model,
         property_graph_store=graph_store,
-        show_progress=True
+        use_async=False
     )
+    index.storage_context.persist(persist_dir=persist_dir)
     return index
+
+# Function to load emails from JSON
+def load_emails(file_path, max_emails=10):
+    with open(file_path, 'r') as file:
+        emails_data = json.load(file)
+    
+    emails = []
+    for count, data in enumerate(emails_data):
+        if count >= max_emails:
+            break
+        email_text = data['Body']
+        document = Document(text=email_text)  # Only store text, no embedding here
+        emails.append(document)
+    return emails
+
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
+def send_request_with_throttling(url, headers, data):
+    response = requests.post(url, headers=headers, json=data)
+    response.raise_for_status()
+    return response.json()
 
 # Main processing logic
 def main():
-    preembedded_emails_file = "files/enriched_email_interactions.json"
-    batch_size = 50
-    max_emails = 50
+    # Configuration
+    persist_dir = "./storage"
+    isa_emails_file = "isa_emails.json"
+    nic_emails_file = "nic_emails.json"
+    max_emails = 10
+
+    # Step 1: Test Neo4j connection
     test_neo4j_connection(uri_neo4j, username_neo4j, password_neo4j)
+
+    # Step 2: Initialize Neo4j graph store
     graph_store = initialize_neo4j_store(username_neo4j, password_neo4j, uri_neo4j)
-    email_batches = load_preembedded_emails(preembedded_emails_file, batch_size, max_emails)
 
-    for email_batch in tqdm(email_batches):
-        try:
-            # Process each batch and get an index
-            index = process_batch(email_batch, kg_extractor, graph_store)
-            
-            # Set up the retrievers using the index
-            llm_synonym = LLMSynonymRetriever(
-                index.property_graph_store,
-                llm=llm,
-                include_text=False,
-            )
+    # Step 3: Load emails in batches from both files
+    isa_emails = load_emails(isa_emails_file, max_emails)
+    nic_emails = load_emails(nic_emails_file, max_emails)
 
-            vector_context = VectorContextRetriever(
-                index.property_graph_store,
-                embed_model=HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5"),
-                include_text=False,
-            )
+    # Combine emails from both files
+    all_emails = isa_emails + nic_emails
 
-            # Set up a retriever to query the graph
-            retriever = index.as_retriever(
-                sub_retrievers=[
-                    llm_synonym,
-                    vector_context,
-                ],
-                include_text=True
-            )
-            logger.info("Successfully set up retriever")
+    # Initialize and save the index if not already done
+    if not os.path.exists(persist_dir):
+        initialize_and_save_index(all_emails, kg_extractor, graph_store, persist_dir)
 
-            # Example query
-            nodes = retriever.retrieve("What happened at Interleaf?")
-            for node in nodes:
-                print(node.text)
-        except Exception as e:
-            logger.error(f"Error processing batch: {e}")
+    # Load the previously saved index
+    index = load_index_from_storage(
+        StorageContext.from_defaults(persist_dir=persist_dir)
+    )
+
+    # Create a retriever from the index
+    retriever = index.as_retriever()
+
+    # # Example of using the retriever
+    # for query in ["Example query 1", "Example query 2"]:
+    #     nodes = retriever.retrieve(query)
+    #     print(f"Results for '{query}': {nodes}")
+
+    # # Optional: Insert new documents if needed
+    # new_emails = load_emails("new_emails.json", max_emails)
+    # if new_emails:
+    #     index.insert(new_emails)
 
 if __name__ == "__main__":
     main()
